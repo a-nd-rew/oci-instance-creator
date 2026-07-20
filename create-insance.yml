@@ -1,0 +1,79 @@
+name: Create OCI Instance
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Write private key
+        env:
+          KEY: ${{ secrets.OCI_KEY_FILE_CONTENT }}
+        run: |
+          mkdir -p ~/.oci
+          echo "$KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+
+      - name: Check existing instances
+        id: check
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_USER_ID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_ID }}
+          OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/key.pem
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
+          SUPPRESS_LABEL_WARNING: True
+        run: |
+          set +e
+          oci iam region list
+          AUTH_RESULT=$?
+          if [ $AUTH_RESULT -ne 0 ]; then
+            echo "Authentication failed"
+            exit 1
+          fi
+          COUNT=$(oci compute instance list \
+            --compartment-id "${{ secrets.OCI_TENANCY_ID }}" \
+            --lifecycle-state RUNNING \
+            --query 'length(data)' \
+            --output raw)
+          echo "Running instances: $COUNT"
+          echo "count=${COUNT:-0}" >> $GITHUB_OUTPUT
+
+      - name: Create instance
+        if: steps.check.outputs.count == '0'
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_USER_ID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_ID }}
+          OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/key.pem
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
+          SUPPRESS_LABEL_WARNING: True
+        run: |
+          for AD in "Wbws:US-ASHBURN-AD-1" "Wbws:US-ASHBURN-AD-2" "Wbws:US-ASHBURN-AD-3"; do
+            echo "Trying $AD..."
+            RESULT=$(oci compute instance launch \
+              --availability-domain "$AD" \
+              --compartment-id "${{ secrets.OCI_TENANCY_ID }}" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --image-id "${{ secrets.OCI_IMAGE_ID }}" \
+              --subnet-id "${{ secrets.OCI_SUBNET_ID }}" \
+              --metadata "{\"ssh_authorized_keys\":\"${{ secrets.OCI_SSH_PUBLIC_KEY }}\"}" \
+              --assign-public-ip true \
+              --display-name "stack-hack" 2>&1 || true)
+            if echo "$RESULT" | grep -q '"id": "ocid1.instance'; then
+              echo "Instance created successfully in $AD!"
+              echo "$RESULT"
+              exit 0
+            fi
+            echo "$RESULT" | tail -5
+          done
+          echo "All ADs out of capacity, will retry next run."
+          exit 1
